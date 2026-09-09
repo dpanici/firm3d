@@ -183,6 +183,7 @@ def boozer_saw_interpolant(field, nfp, ns, ntheta, nzeta):
 def cartesian_interpolant(
     field,
     surface_classifier,
+    flux_label=None,
     rrange=None,
     zrange=None,
     phirange=None,
@@ -201,6 +202,13 @@ def cartesian_interpolant(
               via *rrange*, *zrange*, *phirange*.
         surface_classifier: SurfaceClassifier object used to evaluate the
             signed distance to the plasma boundary at each grid point.
+        flux_label: Optional callable mapping an ``(N, 3)`` array of
+            cylindrical points ``(r, phi, z)`` to ``N`` values of the flux
+            label ``s`` that thermal profiles are parametrized by.  Required
+            for collisional tracing; the values are appended as an extra
+            interpolant column.  The callable must return finite values on
+            the whole grid box, including outside the last closed flux
+            surface.
         rrange: tuple ``(r_start, r_end, n_cells)`` for the R grid.
             Required for DESC fields, ignored for SIMSOPT fields.
         zrange: tuple ``(z_start, z_end, n_cells)`` for the Z grid.
@@ -220,8 +228,9 @@ def cartesian_interpolant(
         z_range : (z_start, z_end, number of grid points in z)
         cell_quad_pts : Interpolant data reordered for GPU access. Shape is
             ``(n_cells * 64, n_features)`` where columns contain the magnetic
-            field, gradient of |B|, and signed distance function values at
-            the spline quadrature nodes for each cell.
+            field, gradient of |B|, the signed distance function, and, when
+            ``flux_label`` is given, the flux label values at the spline
+            quadrature nodes for each cell.
     """
     # ---- Detect field type ------------------------------------------------
     try:
@@ -307,7 +316,22 @@ def cartesian_interpolant(
     # ---- Signed distance + combine features -------------------------------
     signed_dist_vals = surface_classifier.evaluate_rphiz(quad_pts)
 
-    quad_info = np.hstack((B, GradAbsB, signed_dist_vals))
+    if flux_label is None:
+        quad_info = np.hstack((B, GradAbsB, signed_dist_vals))
+    else:
+        s_vals = np.asarray(flux_label(quad_pts), dtype=float).reshape(-1)
+        if s_vals.shape[0] != quad_pts.shape[0]:
+            raise ValueError(
+                f"flux_label returned {s_vals.shape[0]} values for "
+                f"{quad_pts.shape[0]} grid points"
+            )
+        if not np.all(np.isfinite(s_vals)):
+            raise ValueError(
+                "flux_label returned non-finite values on the interpolation "
+                "grid; extend it smoothly beyond the last closed flux surface "
+                "(values above 1 are clamped by the profile lookup)"
+            )
+        quad_info = np.hstack((B, GradAbsB, signed_dist_vals, s_vals[:, None]))
 
     # ---- Reorder for device memory accesses -------------------------------
     cell_quad_pts = np.empty(
