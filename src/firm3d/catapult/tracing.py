@@ -150,6 +150,9 @@ def trace_particles_cartesian_gpu(
     vtotal,
     tol,
     dt=None,
+    rrange=None,
+    zrange=None,
+    phirange=None,  # these are min max and n
 ):
     """
     Trace particles in Cartesian coordinates using CATAPULT
@@ -166,7 +169,7 @@ def trace_particles_cartesian_gpu(
     """
     nparticles = xyz_inits.shape[0]
     r_range, phi_range, z_range, quad_info = cartesian_interpolant(
-        field, surface_classifier
+        field, surface_classifier, rrange=rrange, zrange=zrange, phirange=phirange
     )
     last_time = firm3dpp.cartesian_gpu_tracing(
         quad_pts=quad_info,

@@ -180,16 +180,39 @@ def boozer_saw_interpolant(field, nfp, ns, ntheta, nzeta):
     return srange, trange, zrange, cell_quad_pts, np.max(J)
 
 
-def cartesian_interpolant(field, surface_classifier):
+def cartesian_interpolant(
+    field,
+    surface_classifier,
+    rrange=None,
+    zrange=None,
+    phirange=None,
+    source_grid=None,
+    **kwargs,
+):
     r"""
     Set up a Cartesian (cylindrical) interpolant for GPU tracing.
 
     Args:
-        field: InterpolatedField object (simsopt) defined in cylindrical
-            coordinates with ``r_range``, ``phi_range``, and ``z_range``
-            attributes.
+        field: Magnetic field object. Supports either:
+
+            - SIMSOPT ``InterpolatedField`` – grid ranges are read from the
+              field's ``r_range``, ``phi_range``, ``z_range`` attributes.
+            - DESC ``_MagneticField`` subclass – grid ranges must be supplied
+              via *rrange*, *zrange*, *phirange*.
         surface_classifier: SurfaceClassifier object used to evaluate the
             signed distance to the plasma boundary at each grid point.
+        rrange: tuple ``(r_start, r_end, n_cells)`` for the R grid.
+            Required for DESC fields, ignored for SIMSOPT fields.
+        zrange: tuple ``(z_start, z_end, n_cells)`` for the Z grid.
+            Required for DESC fields, ignored for SIMSOPT fields.
+        phirange: tuple ``(phi_start, phi_end, n_cells)`` for the phi grid.
+            Required for DESC fields, ignored for SIMSOPT fields.
+        source_grid: Grid used to discretize a DESC ``_MagneticField`` when
+            computing B via Biot-Savart. Ignored for SIMSOPT fields.
+            Default is ``None``.
+        **kwargs: Additional keyword arguments. For DESC fields,
+            ``chunk_size`` (default 100) controls the chunk size used by
+            ``vmap_chunked`` when computing the gradient of |B|.
 
     Returns:
         r_range : (r_start, r_end, number of grid points in r)
@@ -200,11 +223,38 @@ def cartesian_interpolant(field, surface_classifier):
             field, gradient of |B|, and signed distance function values at
             the spline quadrature nodes for each cell.
     """
+    # ---- Detect field type ------------------------------------------------
+    try:
+        from simsopt.field import InterpolatedField
 
-    r_range = (field.r_range[0], field.r_range[1], 3 * field.r_range[2] + 1)
-    phi_range = (field.phi_range[0], field.phi_range[1], 3 * field.phi_range[2] + 1)
-    z_range = (field.z_range[0], field.z_range[1], 3 * field.z_range[2] + 1)
+        is_simsopt = isinstance(field, InterpolatedField)
+    except ImportError:
+        is_simsopt = False
 
+    if is_simsopt:
+        # SIMSOPT: ranges come from the field object
+        r_range = (field.r_range[0], field.r_range[1], 3 * field.r_range[2] + 1)
+        phi_range = (field.phi_range[0], field.phi_range[1], 3 * field.phi_range[2] + 1)
+        z_range = (field.z_range[0], field.z_range[1], 3 * field.z_range[2] + 1)
+        n_r_cells = field.r_range[2]
+        n_phi_cells = field.phi_range[2]
+        n_z_cells = field.z_range[2]
+    else:
+        # DESC (or other): ranges must be provided by the user
+        if rrange is None or zrange is None or phirange is None:
+            raise ValueError(
+                "rrange, zrange, and phirange must be provided for "
+                "non-SIMSOPT fields. Each should be a tuple "
+                "(start, end, n_cells)."
+            )
+        r_range = (rrange[0], rrange[1], 3 * rrange[2] + 1)
+        phi_range = (phirange[0], phirange[1], 3 * phirange[2] + 1)
+        z_range = (zrange[0], zrange[1], 3 * zrange[2] + 1)
+        n_r_cells = rrange[2]
+        n_phi_cells = phirange[2]
+        n_z_cells = zrange[2]
+
+    # ---- Build cylindrical grid -------------------------------------------
     r_grid = np.linspace(r_range[0], r_range[1], r_range[2])
     phi_grid = np.linspace(phi_range[0], phi_range[1], phi_range[2])
     z_grid = np.linspace(z_range[0], z_range[1], z_range[2])
@@ -219,35 +269,59 @@ def cartesian_interpolant(field, surface_classifier):
                     z_grid[k],
                 ]
 
-    field.set_points_cyl(quad_pts)
+    # ---- Compute B and GradAbsB ------------------------------------------
+    if is_simsopt:
+        field.set_points_cyl(quad_pts)
+        B = field.B_cyl()
+        GradAbsB = field.GradAbsB_cyl()
+    else:
+        # DESC path
+        import jax
+        import jax.numpy as jnp
+        from desc.batching import vmap_chunked
+        from desc.backend import print_backend_info
 
-    # Quantities to interpolate
-    B = field.B_cyl()
-    GradAbsB = field.GradAbsB_cyl()
+        print_backend_info()
+        print("computing DESC field")
+        B = np.array(
+            field.compute_magnetic_field(quad_pts, basis="rpz", source_grid=source_grid)
+        )
+        print("finished computing DESC field")
 
+        # Compute GradAbsB via JAX autodiff + chunked vmap
+        def absB_at_point(rpz):
+            """Compute |B| at a single (R, phi, Z) point."""
+            B_rpz = field.compute_magnetic_field(
+                rpz.reshape(1, 3), basis="rpz", source_grid=source_grid
+            )
+            return jnp.sqrt(jnp.sum(B_rpz**2))
+
+        grad_absB_fn = jax.grad(absB_at_point)
+        chunk_size = kwargs.get("chunk_size", 1000)
+        print("computing desc field gradient")
+        GradAbsB = np.array(
+            vmap_chunked(grad_absB_fn, chunk_size=chunk_size)(jnp.array(quad_pts))
+        )
+        print("finished computing desc field gradient")
+
+    # ---- Signed distance + combine features -------------------------------
     signed_dist_vals = surface_classifier.evaluate_rphiz(quad_pts)
 
     quad_info = np.hstack((B, GradAbsB, signed_dist_vals))
 
-    # reorder for device memory accesses
-    # print("reordering interpolant data form device accesses")
+    # ---- Reorder for device memory accesses -------------------------------
     cell_quad_pts = np.empty(
         (
-            field.r_range[2] * field.z_range[2] * field.phi_range[2] * 64,
+            n_r_cells * n_z_cells * n_phi_cells * 64,
             quad_info.shape[1],
         )
     )
-    for cell_r in range(field.r_range[2]):
-        for cell_phi in range(field.phi_range[2]):
-            for cell_z in range(field.z_range[2]):
+    for cell_r in range(n_r_cells):
+        for cell_phi in range(n_phi_cells):
+            for cell_z in range(n_z_cells):
                 row_start = 64 * (
-                    cell_r * field.phi_range[2] * field.z_range[2]
-                    + cell_phi * field.z_range[2]
-                    + cell_z
+                    cell_r * n_phi_cells * n_z_cells + cell_phi * n_z_cells + cell_z
                 )
-
-                # if cell_r == 24 and cell_phi == 22 and cell_z == 20:
-                #     print(row_start)
 
                 assert 3 * cell_r + i < r_range[2]
                 # iterate over spline locations for this cell
