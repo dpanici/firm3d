@@ -194,6 +194,7 @@ def cartesian_interpolant(
     zrange=None,
     phirange=None,
     source_grid=None,
+    curl_B=False,
     **kwargs,
 ):
     r"""
@@ -224,6 +225,9 @@ def cartesian_interpolant(
         source_grid: Grid used to discretize a DESC ``_MagneticField`` when
             computing B via Biot-Savart. Ignored for SIMSOPT fields.
             Default is ``None``.
+        curl_B: Also tabulate curl B (= mu0 J, physical cylindrical components)
+            after the flux label, for the full (non-vacuum) guiding-center
+            equations. DESC fields only; needs ``flux_label``.
         **kwargs: Additional keyword arguments. For DESC fields,
             ``chunk_size`` (default 100) controls the chunk size used by
             ``vmap_chunked`` when computing the gradient of |B|.
@@ -323,9 +327,36 @@ def cartesian_interpolant(
         GradAbsB[:, 1] /= quad_pts[:, 0]
         print("finished computing desc field gradient")
 
+        if curl_B:
+            # dB_i/d(R, phi, Z) of the physical cylindrical components, then
+            # curl B = ((1/R) dBz/dphi - dBphi/dZ, dBr/dZ - dBz/dR,
+            #           dBphi/dR + Bphi/R - (1/R) dBr/dphi)
+            def B_at_point(rpz):
+                return field.compute_magnetic_field(
+                    rpz.reshape(1, 3), basis="rpz", source_grid=source_grid
+                )[0]
+
+            print("computing desc field curl")
+            jac = np.array(
+                vmap_chunked(jax.jacfwd(B_at_point), chunk_size=chunk_size)(
+                    jnp.array(quad_pts)
+                )
+            )
+            R = quad_pts[:, 0]
+            CurlB = np.column_stack(
+                [
+                    jac[:, 2, 1] / R - jac[:, 1, 2],
+                    jac[:, 0, 2] - jac[:, 2, 0],
+                    jac[:, 1, 0] + B[:, 1] / R - jac[:, 0, 1] / R,
+                ]
+            )
+            print("finished computing desc field curl")
+
     # ---- Signed distance + combine features -------------------------------
     signed_dist_vals = surface_classifier.evaluate_rphiz(quad_pts)
 
+    if curl_B and (is_simsopt or flux_label is None):
+        raise ValueError("curl_B needs a DESC field and a flux_label")
     if flux_label is None:
         quad_info = np.hstack((B, GradAbsB, signed_dist_vals))
     else:
@@ -342,6 +373,8 @@ def cartesian_interpolant(
                 "(values above 1 are clamped by the profile lookup)"
             )
         quad_info = np.hstack((B, GradAbsB, signed_dist_vals, s_vals[:, None]))
+        if curl_B:
+            quad_info = np.hstack((quad_info, CurlB))
 
     # ---- Reorder for device memory accesses -------------------------------
     cell_quad_pts = np.empty(

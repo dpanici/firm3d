@@ -31,7 +31,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 // enum used for templating
 // https://stackoverflow.com/questions/9116267/how-can-i-use-an-enumeration-as-a-template-parameter
-enum class RHS {GC_CartesianVacuum, GC_CartesianVacuumColl, GC_BoozerVacuum, GC_Boozer, GC_BoozerVacuumSAW, GC_BoozerNoKSAW};
+enum class RHS {GC_CartesianVacuum, GC_CartesianVacuumColl, GC_CartesianColl, GC_BoozerVacuum, GC_Boozer, GC_BoozerVacuumSAW, GC_BoozerNoKSAW};
 
 enum class CoordSys {Cartesian, Boozer};
 
@@ -39,7 +39,7 @@ template<RHS id>
 __host__ __device__ constexpr CoordSys map_rhs_to_coord(){
     if constexpr(id == RHS::GC_BoozerVacuum || id == RHS::GC_Boozer || id == RHS::GC_BoozerVacuumSAW || id == RHS::GC_BoozerNoKSAW){
         return CoordSys::Boozer;
-    } else if constexpr (id == RHS::GC_CartesianVacuum || id == RHS::GC_CartesianVacuumColl) {
+    } else if constexpr (id == RHS::GC_CartesianVacuum || id == RHS::GC_CartesianVacuumColl || id == RHS::GC_CartesianColl) {
         return CoordSys::Cartesian;
     }
 }
@@ -289,6 +289,85 @@ __device__ void calc_derivs<RHS::GC_CartesianVacuumColl>(double* derivs, int der
                                     double* mu, int nparticles_blk){
     cartesian_vacuum_derivs<8>(derivs, deriv_id, quadpts_arr, x_temp, symmetry_exploited,
                                index_i, index_j, index_k, x1_shape, x2_shape, x3_shape, mu, nparticles_blk);
+}
+
+
+// ---------------------------------------------------------------------------
+// Guiding center cartesian right-hand side without the vacuum assumption:
+// the full (Littlejohn) equations with E = 0,
+//     B* = B + (m v_par / q) curl b,   curl b = curl B / |B| + B x grad|B| / |B|^2,
+//     B*_par = b . B* = |B| + (m v_par / q) B . curl B / |B|^2,
+//     dX/dt = (v_par B* + (m mu / q) b x grad|B|) / B*_par,
+//     dv_par/dt = -mu B* . grad|B| / B*_par,
+// with mu = v_perp^2 / (2 |B|).  With curl B = 0 this is cartesian_vacuum_derivs.
+// Columns: 0-2 B, 3-5 grad|B|, 6 boundary distance, 7 flux label,
+// 8-10 curl B (= mu0 J), all in physical cylindrical components.
+// Under stellarator symmetry curl B transforms like B.
+// ---------------------------------------------------------------------------
+template <int NCOLS>
+__device__ void cartesian_full_derivs(double* derivs, int deriv_id, double* quadpts_arr, double* x_temp, bool* symmetry_exploited,
+                                    int* index_i, int* index_j, int* index_k, double* x1_shape, double* x2_shape, double* x3_shape,
+                                    double* mu, int nparticles_blk){
+
+    __shared__ double block_interpolants[NCOLS*PARTICLES_PER_BLOCK];
+
+    __syncthreads();
+    interpolate<NCOLS>(block_interpolants, quadpts_arr, index_i, index_j, index_k, x1_shape, x2_shape, x3_shape, nparticles_blk);
+    __syncthreads();
+
+    if(threadIdx.x < nparticles_blk){
+        double x = x_temp[1*PARTICLES_PER_BLOCK + threadIdx.x];
+        double y = x_temp[2*PARTICLES_PER_BLOCK + threadIdx.x];
+        double v_par = x_temp[4*PARTICLES_PER_BLOCK + threadIdx.x];
+
+        double B_r = block_interpolants[0*PARTICLES_PER_BLOCK + threadIdx.x];
+        double B_phi = block_interpolants[1*PARTICLES_PER_BLOCK + threadIdx.x];
+        double B_z = block_interpolants[2*PARTICLES_PER_BLOCK + threadIdx.x];
+        double G_r = block_interpolants[3*PARTICLES_PER_BLOCK + threadIdx.x];
+        double G_phi = block_interpolants[4*PARTICLES_PER_BLOCK + threadIdx.x];
+        double G_z = block_interpolants[5*PARTICLES_PER_BLOCK + threadIdx.x];
+        double C_r = block_interpolants[8*PARTICLES_PER_BLOCK + threadIdx.x];
+        double C_phi = block_interpolants[9*PARTICLES_PER_BLOCK + threadIdx.x];
+        double C_z = block_interpolants[10*PARTICLES_PER_BLOCK + threadIdx.x];
+
+        if(symmetry_exploited[threadIdx.x]){
+            B_r *= -1.0;
+            G_phi *= -1.0;
+            G_z *= -1.0;
+            C_r *= -1.0;
+        }
+
+        double phi = atan2(y, x);
+        double c = cos(phi), s = sin(phi);
+        double B[3] = {c*B_r - s*B_phi, s*B_r + c*B_phi, B_z};
+        double G[3] = {c*G_r - s*G_phi, s*G_r + c*G_phi, G_z};
+        double C[3] = {c*C_r - s*C_phi, s*C_r + c*C_phi, C_z};
+
+        double AbsB = sqrt(B[0]*B[0] + B[1]*B[1] + B[2]*B[2]);
+        double BxG[3] = {B[1]*G[2] - B[2]*G[1], B[2]*G[0] - B[0]*G[2], B[0]*G[1] - B[1]*G[0]};
+        double rho_par = mass_d*v_par/charge_d;
+        double Bstar[3];
+        for(int i = 0; i < 3; ++i){
+            Bstar[i] = B[i] + rho_par*(C[i]/AbsB + BxG[i]/(AbsB*AbsB));
+        }
+        double Bstar_par = AbsB + rho_par*(B[0]*C[0] + B[1]*C[1] + B[2]*C[2])/(AbsB*AbsB);
+        double fak_mu = mass_d*mu[threadIdx.x]/(charge_d*AbsB);  // (m mu / q) b x grad|B| = fak_mu B x grad|B|
+
+        for(int i = 0; i < 3; ++i){
+            derivs[(6*deriv_id + i)*PARTICLES_PER_BLOCK + threadIdx.x] = (v_par*Bstar[i] + fak_mu*BxG[i])/Bstar_par;
+        }
+        derivs[(6*deriv_id + 3)*PARTICLES_PER_BLOCK + threadIdx.x] = -mu[threadIdx.x]*(Bstar[0]*G[0] + Bstar[1]*G[1] + Bstar[2]*G[2])/Bstar_par;
+        derivs[(6*deriv_id + 4)*PARTICLES_PER_BLOCK + threadIdx.x] = AbsB; // AbsB
+        derivs[(6*deriv_id + 5)*PARTICLES_PER_BLOCK + threadIdx.x] = block_interpolants[6*PARTICLES_PER_BLOCK + threadIdx.x]; // boundary dist fn
+    }
+}
+
+template <>
+__device__ void calc_derivs<RHS::GC_CartesianColl>(double* derivs, int deriv_id, double* quadpts_arr, double* x_temp, bool* symmetry_exploited,
+                                    int* index_i, int* index_j, int* index_k, double* x1_shape, double* x2_shape, double* x3_shape,
+                                    double* mu, int nparticles_blk){
+    cartesian_full_derivs<11>(derivs, deriv_id, quadpts_arr, x_temp, symmetry_exploited,
+                              index_i, index_j, index_k, x1_shape, x2_shape, x3_shape, mu, nparticles_blk);
 }
 
 
@@ -1027,9 +1106,10 @@ __device__ void adjust_time(double* t, double* dt, double* state, double* derivs
                 double x2 = state[1*PARTICLES_PER_BLOCK + threadIdx.x];
                 t_therm = collision_kick(state, mu, derivs, dt_accepted, sqrt(x1*x1 + x2*x2), rng, v_out);
             }
-        } else if constexpr (id == RHS::GC_CartesianVacuumColl) {
+        } else if constexpr (id == RHS::GC_CartesianVacuumColl || id == RHS::GC_CartesianColl) {
             if (mu != nullptr && rng != nullptr && v_out != nullptr && coll_n_backgrounds_d > 0) {
-                double s_flux = interpolate_one_column<8>(quadpts_arr, 7,
+                constexpr int ncols = (id == RHS::GC_CartesianColl) ? 11 : 8;
+                double s_flux = interpolate_one_column<ncols>(quadpts_arr, 7,
                     index_i, index_j, index_k, x1_shape, x2_shape, x3_shape);
                 t_therm = collision_kick(state, mu, derivs, dt_accepted, s_flux, rng, v_out);
             }
@@ -1325,18 +1405,27 @@ extern "C" vector<double> cartesian_gpu_tracing(py::array_t<double> quad_pts, py
 // Collisional Cartesian tracing.  Identical to cartesian_gpu_tracing apart
 // from uploading the background profiles and a seed, and reading the
 // 8-column quad-point layout whose last column is the flux label the
-// profiles are parametrized by.
+// profiles are parametrized by.  With vacuum=false the full guiding-center
+// equations are used (cartesian_full_derivs), which need three more columns:
+// curl B.
 extern "C" vector<double> cartesian_collision_gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> rrange,
         py::array_t<double> phirange, py::array_t<double> zrange, py::array_t<double> xyz_init, double m, double q, double vtotal, py::array_t<double> vtang,
         double tmax, double tol, py::array_t<double> dt_in, int nparticles,
         const vector<ThermalBackground>& backgrounds, unsigned long long rng_seed=0, bool stellsym=true,
-        double min_energy=0.0, double min_thermal=0.0){
+        double min_energy=0.0, double min_thermal=0.0, bool vacuum=true){
 
+    const long expected_cols = vacuum ? 8 : 11;
+    if (quad_pts.ndim() != 2 || quad_pts.shape(1) != expected_cols) {
+        throw std::invalid_argument("cartesian_collision_gpu_tracing: quad_pts must have " + std::to_string(expected_cols)
+                                    + " columns for vacuum=" + (vacuum ? "true" : "false"));
+    }
     set_stellsym(stellsym);
     set_thermalization(backgrounds, min_energy, min_thermal);
     vector<double*> owned = upload_collision_backgrounds(backgrounds, rng_seed);
 
-    vector<double> results = gpu_tracing<RHS::GC_CartesianVacuumColl, 7>(quad_pts, rrange, phirange, zrange, xyz_init, m, q, vtotal, vtang, tmax, tol, dt_in, nparticles);
+    vector<double> results = vacuum
+        ? gpu_tracing<RHS::GC_CartesianVacuumColl, 7>(quad_pts, rrange, phirange, zrange, xyz_init, m, q, vtotal, vtang, tmax, tol, dt_in, nparticles)
+        : gpu_tracing<RHS::GC_CartesianColl, 7>(quad_pts, rrange, phirange, zrange, xyz_init, m, q, vtotal, vtang, tmax, tol, dt_in, nparticles);
 
     // Switch collisions back off and release the profile buffers.
     int zero = 0;

@@ -248,6 +248,7 @@ def trace_particles_cartesian_with_collisions_gpu(
     stellsym=True,
     min_energy=0.0,
     min_thermal=0.0,
+    vacuum=True,
 ):
     """
     Trace particles in Cartesian coordinates on the GPU, including Monte
@@ -296,6 +297,10 @@ def trace_particles_cartesian_with_collisions_gpu(
             then cover ``z < 0`` too.
         min_energy, min_thermal: Thermalization stop; see
             :func:`trace_particles_boozer_with_collisions_gpu`.
+        vacuum: Use the vacuum guiding-center equations (curl B = 0, the
+            default). With False, curl B of the field is tabulated too and the
+            full equations are used, B* = B + (m v_par/q) curl b; this adds the
+            plasma-current (O(beta)) terms. DESC fields only.
 
     Returns:
         ``(nparticles, 7)`` array of final states,
@@ -352,6 +357,7 @@ def trace_particles_cartesian_with_collisions_gpu(
         rrange=rrange,
         zrange=zrange,
         phirange=phirange,
+        curl_B=not vacuum,
     )
     _check_full_z(z_range, stellsym)
     last_time = firm3dpp.cartesian_collision_gpu_tracing(
@@ -372,6 +378,7 @@ def trace_particles_cartesian_with_collisions_gpu(
         rng_seed=int(rng_seed),
         stellsym=stellsym,
         **_thermalization_kwargs(min_energy, min_thermal),
+        **({} if vacuum else {"vacuum": False}),
     )
     return np.reshape(last_time, (nparticles, 7))
 
