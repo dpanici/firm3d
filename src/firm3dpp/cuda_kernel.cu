@@ -95,6 +95,10 @@ __constant__ unsigned long long coll_seed_d = 0;
 
 __constant__ bool rescale_abstol_var_d = true;
 __constant__ bool is_test_d = false;
+// Whether map_to_grid may use stellarator symmetry to look up only half the domain (z >= 0 in
+// Cartesian, theta <= pi in Boozer). Only valid for stellarator-symmetric fields; with false the
+// interpolant must cover the full domain. Every entry point sets it through set_stellsym().
+__constant__ bool stellsym_d = true;
 
 /* shape computes shape functions for cubic interpolation on a a regular grid
  * we assume the point x has been rescaled to be on the grid 0, 1, 2, 3
@@ -674,7 +678,7 @@ __device__ void map_to_grid<CoordSys::Cartesian>(double* interp_pt, double* x_te
     phi += period*(phi < 0);
 
     // exploit stellarator symmetry
-    symmetry_exploited[threadIdx.x] = z < 0;
+    symmetry_exploited[threadIdx.x] = stellsym_d && z < 0;
     if(symmetry_exploited[threadIdx.x]){
         z = -z;
         phi = 2*M_PI - phi;
@@ -707,7 +711,7 @@ __device__ void map_to_grid<CoordSys::Boozer>(double* interp_pt, double* x_temp,
     z += period*(z < 0);
 
     // exploit stellarator symmetry
-    symmetry_exploited[threadIdx.x] = t > M_PI;
+    symmetry_exploited[threadIdx.x] = stellsym_d && t > M_PI;
     if(symmetry_exploited[threadIdx.x]){
         z = period - z;
         t = 2*M_PI - t;
@@ -759,6 +763,10 @@ __device__ void build_state(double* x_temp, int deriv_id, bool* symmetry_exploit
     k = min(k, (int)x3_range_d[2]-4);
 
     i = max(i, 0); // if r too small to be in the device, extrapolate
+    // Likewise below the other two grids: without stellarator symmetry, z (or a trial stage
+    // overshooting the wall) can fall below the table, which would otherwise index before it
+    j = max(j, 0);
+    k = max(k, 0);
 
     // normalized positions in local grid wrt e.g. r at index i
     // maps the position to [0,3] in the "meta grid"
@@ -1144,6 +1152,11 @@ static vector<double*> upload_collision_backgrounds(
     return owned;
 }
 
+// Set stellsym_d on every call, so a value never carries over from a previous trace
+static void set_stellsym(bool stellsym){
+    gpuErrchk(cudaMemcpyToSymbol(stellsym_d, &stellsym, sizeof(bool)));
+}
+
 template<RHS id, int NCOLS = 6, typename... Args>
 vector<double> gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
     py::array_t<double> loc_init, double m, double q, double vtotal, py::array_t<double> vtang, double tmax, double tol, py::array_t<double> dt_in, int nparticles, Args... args){
@@ -1248,7 +1261,8 @@ vector<double> gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> x1_
 
 extern "C" vector<double> cartesian_gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> rrange,
         py::array_t<double> phirange, py::array_t<double> zrange, py::array_t<double> xyz_init, double m, double q, double vtotal, py::array_t<double> vtang,
-        double tmax, double tol, py::array_t<double> dt_in, int nparticles){
+        double tmax, double tol, py::array_t<double> dt_in, int nparticles, bool stellsym=true){
+            set_stellsym(stellsym);
             return gpu_tracing<RHS::GC_CartesianVacuum>(quad_pts, rrange, phirange, zrange, xyz_init, m, q, vtotal, vtang, tmax, tol, dt_in, nparticles);
         }
 
@@ -1259,8 +1273,9 @@ extern "C" vector<double> cartesian_gpu_tracing(py::array_t<double> quad_pts, py
 extern "C" vector<double> cartesian_collision_gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> rrange,
         py::array_t<double> phirange, py::array_t<double> zrange, py::array_t<double> xyz_init, double m, double q, double vtotal, py::array_t<double> vtang,
         double tmax, double tol, py::array_t<double> dt_in, int nparticles,
-        const vector<ThermalBackground>& backgrounds, unsigned long long rng_seed=0){
+        const vector<ThermalBackground>& backgrounds, unsigned long long rng_seed=0, bool stellsym=true){
 
+    set_stellsym(stellsym);
     vector<double*> owned = upload_collision_backgrounds(backgrounds, rng_seed);
 
     vector<double> results = gpu_tracing<RHS::GC_CartesianVacuumColl, 7>(quad_pts, rrange, phirange, zrange, xyz_init, m, q, vtotal, vtang, tmax, tol, dt_in, nparticles);
@@ -1283,8 +1298,9 @@ extern "C" vector<double> boozer_collision_gpu_tracing(py::array_t<double> quad_
         py::array_t<double> trange, py::array_t<double> zrange, py::array_t<double> stz_init, double m, double q, double vtotal, py::array_t<double> vtang,
         double tmax, double tol, py::array_t<double> dt_in, double psi0, int nparticles,
         const vector<ThermalBackground>& backgrounds, bool vacuum=false,
-        unsigned long long rng_seed=0){
+        unsigned long long rng_seed=0, bool stellsym=true){
 
+    set_stellsym(stellsym);
     double* stz_init_arr = create_array(stz_init);
     for(int i=0; i<nparticles; ++i){
         double s = stz_init_arr[3*i];
@@ -1319,8 +1335,10 @@ extern "C" vector<double> boozer_collision_gpu_tracing(py::array_t<double> quad_
 
 extern "C" vector<double> boozer_gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> srange,
         py::array_t<double> trange, py::array_t<double> zrange, py::array_t<double> stz_init, double m, double q, double vtotal, py::array_t<double> vtang,
-        double tmax, double tol, py::array_t<double> dt_in, double psi0, int nparticles, bool vacuum=false){
+        double tmax, double tol, py::array_t<double> dt_in, double psi0, int nparticles, bool vacuum=false,
+        bool stellsym=true){
 
+    set_stellsym(stellsym);
     //  read data in from python
     double* stz_init_arr = create_array(stz_init);
 
@@ -1356,6 +1374,7 @@ extern "C" vector<double> boozer_saw_gpu_tracing(py::array_t<double> quad_pts, p
         double saw_omega, py::array_t<double> saw_srange, py::array_t<int> saw_m, py::array_t<int> saw_n, py::array_t<double> saw_phihats, int saw_nharmonics,
         py::array_t<double> stz_init, double m, double q, double vtotal, py::array_t<double> vtang, double tmax, double tol, py::array_t<double> dt_in, double psi0, int nparticles){
 
+    set_stellsym(true);  // the SAW interpolant only covers theta <= pi
     //  read data in from python
     double* stz_init_arr = create_array(stz_init);
     double* saw_srange_arr = create_array(saw_srange);
@@ -1413,6 +1432,7 @@ extern "C" vector<double> boozer_saw_nok_gpu_tracing(py::array_t<double> quad_pt
         double saw_omega, py::array_t<double> saw_srange, py::array_t<int> saw_m, py::array_t<int> saw_n, py::array_t<double> saw_phihats, int saw_nharmonics,
         py::array_t<double> stz_init, double m, double q, double vtotal, py::array_t<double> vtang, double tmax, double tol, py::array_t<double> dt_in, double psi0, int nparticles){
 
+    set_stellsym(true);  // the SAW interpolant only covers theta <= pi
     //  read data in from python
     double* stz_init_arr = create_array(stz_init);
     double* saw_srange_arr = create_array(saw_srange);
@@ -1576,6 +1596,7 @@ __global__ void test_gpu_interpolation_kernel(double* quad_pts, double* loc, dou
 
 
 extern "C" py::array_t<double> test_gpu_interpolation(py::array_t<double> quad_pts, py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range, py::array_t<double> loc, std::string rhs, int n_points){
+    set_stellsym(true);  // the interpolation tests use half-domain interpolants
     // read data in from python
     double* quadpts_arr = create_array(quad_pts);
     double* x1_range_arr = create_array(x1_range);

@@ -16,6 +16,15 @@ from firm3d.field.boozermagneticfield import ShearAlfvenWavesSuperposition
 from firm3d.field.tracing_helpers import _validate_parallel_speeds
 
 
+def _check_full_z(z_range, stellsym):
+    """Without stellarator symmetry the grid must also cover z < 0."""
+    if not stellsym and z_range[0] >= 0:
+        raise ValueError(
+            f"stellsym=False needs an interpolant that also covers z < 0, but the z "
+            f"range starts at {z_range[0]}; pass a zrange spanning the whole plasma"
+        )
+
+
 def trace_particles_boozer_gpu(
     field,
     stz_inits,
@@ -29,6 +38,7 @@ def trace_particles_boozer_gpu(
     ntheta,
     nzeta,
     dt=None,
+    stellsym=None,
 ):
     """
     Trace particles in Boozer coordinates using CATAPULT
@@ -41,12 +51,16 @@ def trace_particles_boozer_gpu(
     vtotal: total velocity of each particle
     tol: tolerance for the ODE solver
     dt: the initial time step size for the solver (optional)
+    stellsym: use stellarator symmetry to tabulate only theta <= pi (default:
+        field.stellsym); must be False for a non-stellarator-symmetric field
     """
     nparticles = stz_inits.shape[0]
     _validate_parallel_speeds(parallel_speeds, vtotal)
 
     if isinstance(field, ShearAlfvenWavesSuperposition):
         B0 = field.B0
+        if not getattr(B0, "stellsym", True) or stellsym is False:
+            raise ValueError("SAW GPU tracing assumes a stellarator-symmetric field")
         srange, trange, zrange, quad_info, maxJ = boozer_saw_interpolant(
             B0, B0.nfp, ns, ntheta, nzeta
         )
@@ -120,8 +134,9 @@ def trace_particles_boozer_gpu(
                      expected 'vac' or ''"
             )
         vacuum = field.field_type == "vac"  # true if vacuum, false if finite beta
+        stellsym = field.stellsym if stellsym is None else stellsym
         srange, trange, zrange, quad_info, maxJ = boozer_interpolant(
-            field, field.nfp, ns, ntheta, nzeta, vacuum=vacuum
+            field, field.nfp, ns, ntheta, nzeta, vacuum=vacuum, stellsym=stellsym
         )
         psi0 = field.psi0
         last_time = firm3dpp.boozer_gpu_tracing(
@@ -140,6 +155,7 @@ def trace_particles_boozer_gpu(
             psi0=psi0,
             nparticles=nparticles,
             vacuum=vacuum,
+            stellsym=stellsym,
         )
 
     last_time = np.reshape(last_time, (nparticles, 6))
@@ -160,6 +176,7 @@ def trace_particles_cartesian_gpu(
     rrange=None,
     zrange=None,
     phirange=None,  # these are min max and n
+    stellsym=True,
 ):
     """
     Trace particles in Cartesian coordinates using CATAPULT
@@ -173,12 +190,15 @@ def trace_particles_cartesian_gpu(
     vtotal: total velocity of each particle
     tol: tolerance for the ODE solver
     dt: the initial time step size for the solver (optional)
+    stellsym: use stellarator symmetry to look up only z >= 0; must be False for a
+        non-stellarator-symmetric field, whose interpolant must then cover z < 0 too
     """
     nparticles = xyz_inits.shape[0]
     _validate_parallel_speeds(parallel_speeds, vtotal)
     r_range, phi_range, z_range, quad_info = cartesian_interpolant(
         field, surface_classifier, rrange=rrange, zrange=zrange, phirange=phirange
     )
+    _check_full_z(z_range, stellsym)
     last_time = firm3dpp.cartesian_gpu_tracing(
         quad_pts=quad_info,
         rrange=r_range,
@@ -193,6 +213,7 @@ def trace_particles_cartesian_gpu(
         tol=tol,
         dt_in=dt if dt is not None else -np.ones(nparticles),
         nparticles=nparticles,
+        stellsym=stellsym,
     )
     last_time = np.reshape(last_time, (nparticles, 6))
     return last_time
@@ -212,6 +233,10 @@ def trace_particles_cartesian_with_collisions_gpu(
     tol,
     dt=None,
     rng_seed=0,
+    rrange=None,
+    zrange=None,
+    phirange=None,
+    stellsym=True,
 ):
     """
     Trace particles in Cartesian coordinates on the GPU, including Monte
@@ -252,6 +277,12 @@ def trace_particles_cartesian_with_collisions_gpu(
         dt: Initial step size; ``None`` lets the tracer choose.
         rng_seed: Base seed.  Each particle uses a Philox stream keyed on its
             global index, so results do not depend on the block layout.
+        rrange, zrange, phirange: ``(start, end, n_cells)`` of the interpolation
+            grid. Required for DESC fields, ignored for SIMSOPT fields (which carry
+            their own grid); see :func:`~firm3d.catapult.utils.cartesian_interpolant`.
+        stellsym: Use stellarator symmetry to look up only ``z >= 0``. Must be
+            False for a non-stellarator-symmetric field, whose interpolant must
+            then cover ``z < 0`` too.
 
     Returns:
         ``(nparticles, 7)`` array of final states,
@@ -302,8 +333,14 @@ def trace_particles_cartesian_with_collisions_gpu(
     _validate_coulomb_log(cpp_backgrounds, float(mass), float(charge))
 
     r_range, phi_range, z_range, quad_info = cartesian_interpolant(
-        field, surface_classifier, flux_label=flux_label
+        field,
+        surface_classifier,
+        flux_label=flux_label,
+        rrange=rrange,
+        zrange=zrange,
+        phirange=phirange,
     )
+    _check_full_z(z_range, stellsym)
     last_time = firm3dpp.cartesian_collision_gpu_tracing(
         quad_pts=quad_info,
         rrange=r_range,
@@ -320,6 +357,7 @@ def trace_particles_cartesian_with_collisions_gpu(
         nparticles=nparticles,
         backgrounds=cpp_backgrounds,
         rng_seed=int(rng_seed),
+        stellsym=stellsym,
     )
     return np.reshape(last_time, (nparticles, 7))
 
@@ -339,6 +377,7 @@ def trace_particles_boozer_with_collisions_gpu(
     nzeta,
     dt=None,
     rng_seed=0,
+    stellsym=None,
 ):
     """
     Trace particles in Boozer coordinates on the GPU, including Monte Carlo
@@ -390,6 +429,9 @@ def trace_particles_boozer_with_collisions_gpu(
         dt: Initial step size; ``None`` lets the tracer choose.
         rng_seed: Base seed.  Each particle uses a Philox stream keyed on its
             global index, so results do not depend on the block layout.
+        stellsym: Use stellarator symmetry to tabulate only ``theta <= pi``
+            (default: ``field.stellsym``). Must be False for a
+            non-stellarator-symmetric field.
 
     Returns:
         ``(nparticles, 7)`` array of final states,
@@ -440,8 +482,9 @@ def trace_particles_boozer_with_collisions_gpu(
     cpp_backgrounds = [b._to_cpp() for b in backgrounds]
     _validate_coulomb_log(cpp_backgrounds, float(mass), float(charge))
 
+    stellsym = field.stellsym if stellsym is None else stellsym
     srange, trange, zrange, quad_info, maxJ = boozer_interpolant(
-        field, field.nfp, ns, ntheta, nzeta, vacuum=vacuum
+        field, field.nfp, ns, ntheta, nzeta, vacuum=vacuum, stellsym=stellsym
     )
     last_time = firm3dpp.boozer_collision_gpu_tracing(
         quad_pts=quad_info,
@@ -461,5 +504,6 @@ def trace_particles_boozer_with_collisions_gpu(
         backgrounds=cpp_backgrounds,
         vacuum=vacuum,
         rng_seed=int(rng_seed),
+        stellsym=stellsym,
     )
     return np.reshape(last_time, (nparticles, 7))

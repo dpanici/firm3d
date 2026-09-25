@@ -6,7 +6,7 @@ import numpy as np
 __all__ = ["boozer_interpolant", "cartesian_interpolant"]
 
 
-def boozer_interpolant(field, nfp, ns, ntheta, nzeta, vacuum=False):
+def boozer_interpolant(field, nfp, ns, ntheta, nzeta, vacuum=False, stellsym=True):
     r"""
     Set up a Boozer vacuum interpolant for tracing.
 
@@ -15,6 +15,9 @@ def boozer_interpolant(field, nfp, ns, ntheta, nzeta, vacuum=False):
         nfp: Integer, number of field periods in the device
         n_meta_grid_pts: Integer, number of cells in s, theta, zeta
             to use for interpolation
+        stellsym: If True, only theta in [0, pi] is tabulated and the GPU kernel
+            maps theta > pi onto it by stellarator symmetry. If False, theta
+            covers [0, 2 pi] with twice the cells, so the resolution is the same.
 
     Returns:
         srange : (s_start, s_end, number of grid points in s for interpolation)
@@ -25,7 +28,10 @@ def boozer_interpolant(field, nfp, ns, ntheta, nzeta, vacuum=False):
         maximum observed J at grid points, useful for rejection sampling
     """
     srange = (0, 1.0, 3 * ns + 1)
-    trange = (0, np.pi, 3 * ntheta + 1)
+    if stellsym:
+        trange = (0, np.pi, 3 * ntheta + 1)
+    else:
+        trange = (0, 2 * np.pi, 3 * (2 * ntheta) + 1)
     zrange = (0, 2 * np.pi / nfp, 3 * nzeta + 1)
 
     s_grid = np.linspace(srange[0], srange[1], srange[2])
@@ -311,6 +317,10 @@ def cartesian_interpolant(
         GradAbsB = np.array(
             vmap_chunked(grad_absB_fn, chunk_size=chunk_size)(jnp.array(quad_pts))
         )
+        # jax.grad gives d|B|/d(R, phi, Z), but the kernel expects the physical
+        # cylindrical components (d|B|/dR, (1/R) d|B|/dphi, d|B|/dZ), as SIMSOPT's
+        # GradAbsB_cyl returns
+        GradAbsB[:, 1] /= quad_pts[:, 0]
         print("finished computing desc field gradient")
 
     # ---- Signed distance + combine features -------------------------------
