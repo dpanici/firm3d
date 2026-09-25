@@ -100,6 +100,14 @@ __constant__ bool is_test_d = false;
 // interpolant must cover the full domain. Every entry point sets it through set_stellsym().
 __constant__ bool stellsym_d = true;
 
+// Thermalization stop, as ASCOT5's ENDCOND_EMIN: a collisional marker is stopped once its kinetic
+// energy drops below max(therm_min_energy_d, therm_min_thermal_d * T of background therm_species_d)
+// and counted as confined. Collisional entry points set these through set_thermalization().
+__constant__ bool   therm_on_d = false;
+__constant__ int    therm_species_d = 0;       // first ion background, whose T ASCOT5 uses
+__constant__ double therm_min_thermal_d = 0.0;
+__constant__ double therm_min_energy_d = 0.0;  // J
+
 /* shape computes shape functions for cubic interpolation on a a regular grid
  * we assume the point x has been rescaled to be on the grid 0, 1, 2, 3
  * i indicates which shape function we are computing
@@ -886,13 +894,16 @@ __device__ void check_has_left<CoordSys::Boozer>(bool* has_left, double* state, 
 // s_flux is the flux label at the post-step position; the caller computes it
 // from whatever its coordinate system provides (the Boozer state carries it
 // directly, the Cartesian path interpolates it).
+//
+// Returns the time into the step at which the marker thermalized (see
+// therm_on_d), or -1 if it did not.
 // ---------------------------------------------------------------------------
-__device__ void collision_kick(double* state, double* mu, double* derivs,
-                               double dt_taken, double s_flux,
-                               curandStatePhilox4_32_10_t* rng,
-                               double* v_out)
+__device__ double collision_kick(double* state, double* mu, double* derivs,
+                                 double dt_taken, double s_flux,
+                                 curandStatePhilox4_32_10_t* rng,
+                                 double* v_out)
 {
-    if (coll_n_backgrounds_d <= 0) return;
+    if (coll_n_backgrounds_d <= 0) return -1.0;
 
     const int tid = threadIdx.x;
     double v_par  = state[3*PARTICLES_PER_BLOCK + tid];
@@ -906,13 +917,22 @@ __device__ void collision_kick(double* state, double* mu, double* derivs,
                                             coll_backgrounds_d, coll_n_backgrounds_d, &c)
         != COLL_OK) {
         // ln_Lambda <= 0: the model is undefined here.
-        return;
+        return -1.0;
+    }
+
+    // Energy below which the marker counts as thermalized; the position, and
+    // so the local temperature, is frozen during the kick.
+    double E_therm = -1.0;
+    if (therm_on_d) {
+        E_therm = fmax(therm_min_energy_d, therm_min_thermal_d * COLL_EV_TO_J
+                       * coll_backgrounds_d[therm_species_d].T_eV(s_flux));
     }
 
     // Sub-cycle exactly as solve_sde does: one sub-step at a time, re-sized
     // from the refreshed coefficients, so sub-steps shrink as the particle
     // slows into faster collision rates.
     double t_left = dt_taken;
+    double t_therm = -1.0;
     while (t_left > 0.0) {
         double h_sub  = t_left / collision_substeps(v, c, t_left);
         double sqrt_h = sqrt(h_sub);
@@ -920,6 +940,10 @@ __device__ void collision_kick(double* state, double* mu, double* derivs,
         double dW_xi = curand_normal_double(rng) * sqrt_h;
         milstein_collision_step(v, xi, c, h_sub, dW_v, dW_xi);
         t_left -= h_sub;
+        if (0.5 * mass_d * v * v < E_therm) {
+            t_therm = dt_taken - fmax(t_left, 0.0);
+            break;
+        }
         if (t_left <= 0.0) break;
         if (compute_collision_coefficients_core(v, s_flux, mass_d, charge_d,
                                                 coll_backgrounds_d, coll_n_backgrounds_d, &c)
@@ -929,6 +953,7 @@ __device__ void collision_kick(double* state, double* mu, double* derivs,
     state[3*PARTICLES_PER_BLOCK + tid] = v * xi;
     mu[tid] = v * v * (1.0 - xi*xi) / (2.0 * B);
     v_out[tid] = v;
+    return t_therm;
 }
 
 // this function estimates error, accepts/rejects the proposed step
@@ -995,20 +1020,28 @@ __device__ void adjust_time(double* t, double* dt, double* state, double* derivs
         }
         // Collision kick on the accepted step.
         constexpr CoordSys coord = map_rhs_to_coord<id>();
+        double t_therm = -1.0;
         if constexpr (coord == CoordSys::Boozer) {
             if (mu != nullptr && rng != nullptr && v_out != nullptr) {
                 double x1 = state[0*PARTICLES_PER_BLOCK + threadIdx.x];
                 double x2 = state[1*PARTICLES_PER_BLOCK + threadIdx.x];
-                collision_kick(state, mu, derivs, dt_accepted, sqrt(x1*x1 + x2*x2), rng, v_out);
+                t_therm = collision_kick(state, mu, derivs, dt_accepted, sqrt(x1*x1 + x2*x2), rng, v_out);
             }
         } else if constexpr (id == RHS::GC_CartesianVacuumColl) {
             if (mu != nullptr && rng != nullptr && v_out != nullptr && coll_n_backgrounds_d > 0) {
                 double s_flux = interpolate_one_column<8>(quadpts_arr, 7,
                     index_i, index_j, index_k, x1_shape, x2_shape, x3_shape);
-                collision_kick(state, mu, derivs, dt_accepted, s_flux, rng, v_out);
+                t_therm = collision_kick(state, mu, derivs, dt_accepted, s_flux, rng, v_out);
             }
         }
         check_has_left<coord>(has_left, state, derivs);
+        // A thermalized marker that is still inside stops here and counts as
+        // confined (t = tmax), as in ASCOT5; the dt column reports the time
+        // it thermalized, negated.
+        if (t_therm >= 0.0 && !has_left[threadIdx.x]) {
+            dt[threadIdx.x] = -(t[threadIdx.x] - dt_accepted + t_therm);
+            t[threadIdx.x] = tmax_d;
+        }
     } else {
         // Reject the step and try again with smaller dt
         dt[threadIdx.x] = dt_new;
@@ -1157,6 +1190,29 @@ static void set_stellsym(bool stellsym){
     gpuErrchk(cudaMemcpyToSymbol(stellsym_d, &stellsym, sizeof(bool)));
 }
 
+// Set the thermalization stop on every collisional call: stop a marker once its energy is below
+// max(min_energy [eV], min_thermal * local T of the first ion background), as ASCOT5's
+// ENDCOND_MIN_ENERGY and ENDCOND_MIN_THERMAL. Both zero (the default) switch it off.
+static void set_thermalization(const vector<ThermalBackground>& backgrounds, double min_energy, double min_thermal){
+    if (min_energy < 0.0 || min_thermal < 0.0) {
+        throw std::invalid_argument("min_energy and min_thermal must be non-negative");
+    }
+    bool on = min_energy > 0.0 || min_thermal > 0.0;
+    int species = -1;
+    for (int i = 0; i < (int)backgrounds.size() && species < 0; ++i) {
+        if (backgrounds[i].charge > 0.0) species = i;
+    }
+    if (min_thermal > 0.0 && species < 0) {
+        throw std::invalid_argument("min_thermal needs an ion (positively charged) background");
+    }
+    species = std::max(species, 0);
+    double min_energy_J = min_energy * COLL_EV_TO_J;
+    gpuErrchk(cudaMemcpyToSymbol(therm_on_d, &on, sizeof(bool)));
+    gpuErrchk(cudaMemcpyToSymbol(therm_species_d, &species, sizeof(int)));
+    gpuErrchk(cudaMemcpyToSymbol(therm_min_thermal_d, &min_thermal, sizeof(double)));
+    gpuErrchk(cudaMemcpyToSymbol(therm_min_energy_d, &min_energy_J, sizeof(double)));
+}
+
 template<RHS id, int NCOLS = 6, typename... Args>
 vector<double> gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> x1_range, py::array_t<double> x2_range, py::array_t<double> x3_range,
     py::array_t<double> loc_init, double m, double q, double vtotal, py::array_t<double> vtang, double tmax, double tol, py::array_t<double> dt_in, int nparticles, Args... args){
@@ -1273,9 +1329,11 @@ extern "C" vector<double> cartesian_gpu_tracing(py::array_t<double> quad_pts, py
 extern "C" vector<double> cartesian_collision_gpu_tracing(py::array_t<double> quad_pts, py::array_t<double> rrange,
         py::array_t<double> phirange, py::array_t<double> zrange, py::array_t<double> xyz_init, double m, double q, double vtotal, py::array_t<double> vtang,
         double tmax, double tol, py::array_t<double> dt_in, int nparticles,
-        const vector<ThermalBackground>& backgrounds, unsigned long long rng_seed=0, bool stellsym=true){
+        const vector<ThermalBackground>& backgrounds, unsigned long long rng_seed=0, bool stellsym=true,
+        double min_energy=0.0, double min_thermal=0.0){
 
     set_stellsym(stellsym);
+    set_thermalization(backgrounds, min_energy, min_thermal);
     vector<double*> owned = upload_collision_backgrounds(backgrounds, rng_seed);
 
     vector<double> results = gpu_tracing<RHS::GC_CartesianVacuumColl, 7>(quad_pts, rrange, phirange, zrange, xyz_init, m, q, vtotal, vtang, tmax, tol, dt_in, nparticles);
@@ -1298,9 +1356,10 @@ extern "C" vector<double> boozer_collision_gpu_tracing(py::array_t<double> quad_
         py::array_t<double> trange, py::array_t<double> zrange, py::array_t<double> stz_init, double m, double q, double vtotal, py::array_t<double> vtang,
         double tmax, double tol, py::array_t<double> dt_in, double psi0, int nparticles,
         const vector<ThermalBackground>& backgrounds, bool vacuum=false,
-        unsigned long long rng_seed=0, bool stellsym=true){
+        unsigned long long rng_seed=0, bool stellsym=true, double min_energy=0.0, double min_thermal=0.0){
 
     set_stellsym(stellsym);
+    set_thermalization(backgrounds, min_energy, min_thermal);
     double* stz_init_arr = create_array(stz_init);
     for(int i=0; i<nparticles; ++i){
         double s = stz_init_arr[3*i];

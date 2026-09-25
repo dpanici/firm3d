@@ -25,6 +25,15 @@ def _check_full_z(z_range, stellsym):
         )
 
 
+def _thermalization_kwargs(min_energy, min_thermal):
+    """firm3dpp arguments for the thermalization stop, passed only when it is on."""
+    if min_energy < 0 or min_thermal < 0:
+        raise ValueError("min_energy and min_thermal must be non-negative")
+    if min_energy == 0 and min_thermal == 0:
+        return {}
+    return {"min_energy": float(min_energy), "min_thermal": float(min_thermal)}
+
+
 def trace_particles_boozer_gpu(
     field,
     stz_inits,
@@ -237,6 +246,8 @@ def trace_particles_cartesian_with_collisions_gpu(
     zrange=None,
     phirange=None,
     stellsym=True,
+    min_energy=0.0,
+    min_thermal=0.0,
 ):
     """
     Trace particles in Cartesian coordinates on the GPU, including Monte
@@ -283,6 +294,8 @@ def trace_particles_cartesian_with_collisions_gpu(
         stellsym: Use stellarator symmetry to look up only ``z >= 0``. Must be
             False for a non-stellarator-symmetric field, whose interpolant must
             then cover ``z < 0`` too.
+        min_energy, min_thermal: Thermalization stop; see
+            :func:`trace_particles_boozer_with_collisions_gpu`.
 
     Returns:
         ``(nparticles, 7)`` array of final states,
@@ -358,6 +371,7 @@ def trace_particles_cartesian_with_collisions_gpu(
         backgrounds=cpp_backgrounds,
         rng_seed=int(rng_seed),
         stellsym=stellsym,
+        **_thermalization_kwargs(min_energy, min_thermal),
     )
     return np.reshape(last_time, (nparticles, 7))
 
@@ -378,6 +392,8 @@ def trace_particles_boozer_with_collisions_gpu(
     dt=None,
     rng_seed=0,
     stellsym=None,
+    min_energy=0.0,
+    min_thermal=0.0,
 ):
     """
     Trace particles in Boozer coordinates on the GPU, including Monte Carlo
@@ -405,7 +421,16 @@ def trace_particles_boozer_with_collisions_gpu(
       ``(vtotal**2 - v_par**2) / (2 |B|)``.  Passing ``|v_par| > vtotal``
       would therefore give a negative ``mu``, so it is rejected.
     * only the final state is returned, not the trajectory;
-    * stopping criteria are not available.
+    * the only stopping criterion is the thermalization stop below.
+
+    Thermalization stop (off by default), as ASCOT5's ``ENDCOND_MIN_ENERGY``
+    and ``ENDCOND_MIN_THERMAL``: a particle is stopped once its kinetic energy
+    drops below ``max(min_energy, min_thermal * T_i)``, with ``T_i`` the local
+    temperature of the first positively charged background.  It is counted as
+    confined, so it is returned with ``t = tmax``, and its ``dt`` column holds
+    the time it thermalized, negated.  Without the stop, a thermalized particle
+    in a cold, dense edge keeps being sub-cycled at ever faster collision rates
+    for the rest of ``tmax``, which can stall the whole trace.
 
     Results are not comparable element-by-element with the CPU tracer even at
     a fixed seed: the two draw from different generators (Philox against
@@ -432,6 +457,10 @@ def trace_particles_boozer_with_collisions_gpu(
         stellsym: Use stellarator symmetry to tabulate only ``theta <= pi``
             (default: ``field.stellsym``). Must be False for a
             non-stellarator-symmetric field.
+        min_energy: Thermalization energy floor in eV (ASCOT5 uses 200); 0
+            disables it.
+        min_thermal: Thermalization threshold as a multiple of the local ion
+            temperature (ASCOT5 uses 2); 0 disables it.
 
     Returns:
         ``(nparticles, 7)`` array of final states,
@@ -505,5 +534,6 @@ def trace_particles_boozer_with_collisions_gpu(
         vacuum=vacuum,
         rng_seed=int(rng_seed),
         stellsym=stellsym,
+        **_thermalization_kwargs(min_energy, min_thermal),
     )
     return np.reshape(last_time, (nparticles, 7))
