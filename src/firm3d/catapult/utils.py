@@ -6,7 +6,7 @@ import numpy as np
 __all__ = ["boozer_interpolant", "cartesian_interpolant"]
 
 
-def boozer_interpolant(field, nfp, ns, ntheta, nzeta, vacuum=False):
+def boozer_interpolant(field, nfp, ns, ntheta, nzeta, vacuum=False, stellsym=True):
     r"""
     Set up a Boozer vacuum interpolant for tracing.
 
@@ -15,6 +15,9 @@ def boozer_interpolant(field, nfp, ns, ntheta, nzeta, vacuum=False):
         nfp: Integer, number of field periods in the device
         n_meta_grid_pts: Integer, number of cells in s, theta, zeta
             to use for interpolation
+        stellsym: If True, only theta in [0, pi] is tabulated and the GPU kernel
+            maps theta > pi onto it by stellarator symmetry. If False, theta
+            covers [0, 2 pi] with twice the cells, so the resolution is the same.
 
     Returns:
         srange : (s_start, s_end, number of grid points in s for interpolation)
@@ -25,7 +28,10 @@ def boozer_interpolant(field, nfp, ns, ntheta, nzeta, vacuum=False):
         maximum observed J at grid points, useful for rejection sampling
     """
     srange = (0, 1.0, 3 * ns + 1)
-    trange = (0, np.pi, 3 * ntheta + 1)
+    if stellsym:
+        trange = (0, np.pi, 3 * ntheta + 1)
+    else:
+        trange = (0, 2 * np.pi, 3 * (2 * ntheta) + 1)
     zrange = (0, 2 * np.pi / nfp, 3 * nzeta + 1)
 
     s_grid = np.linspace(srange[0], srange[1], srange[2])
@@ -180,16 +186,51 @@ def boozer_saw_interpolant(field, nfp, ns, ntheta, nzeta):
     return srange, trange, zrange, cell_quad_pts, np.max(J)
 
 
-def cartesian_interpolant(field, surface_classifier):
+def cartesian_interpolant(
+    field,
+    surface_classifier,
+    flux_label=None,
+    rrange=None,
+    zrange=None,
+    phirange=None,
+    source_grid=None,
+    curl_B=False,
+    **kwargs,
+):
     r"""
     Set up a Cartesian (cylindrical) interpolant for GPU tracing.
 
     Args:
-        field: InterpolatedField object (simsopt) defined in cylindrical
-            coordinates with ``r_range``, ``phi_range``, and ``z_range``
-            attributes.
+        field: Magnetic field object. Supports either:
+
+            - SIMSOPT ``InterpolatedField`` – grid ranges are read from the
+              field's ``r_range``, ``phi_range``, ``z_range`` attributes.
+            - DESC ``_MagneticField`` subclass – grid ranges must be supplied
+              via *rrange*, *zrange*, *phirange*.
         surface_classifier: SurfaceClassifier object used to evaluate the
             signed distance to the plasma boundary at each grid point.
+        flux_label: Optional callable mapping an ``(N, 3)`` array of
+            cylindrical points ``(r, phi, z)`` to ``N`` values of the flux
+            label ``s`` that thermal profiles are parametrized by.  Required
+            for collisional tracing; the values are appended as an extra
+            interpolant column.  The callable must return finite values on
+            the whole grid box, including outside the last closed flux
+            surface.
+        rrange: tuple ``(r_start, r_end, n_cells)`` for the R grid.
+            Required for DESC fields, ignored for SIMSOPT fields.
+        zrange: tuple ``(z_start, z_end, n_cells)`` for the Z grid.
+            Required for DESC fields, ignored for SIMSOPT fields.
+        phirange: tuple ``(phi_start, phi_end, n_cells)`` for the phi grid.
+            Required for DESC fields, ignored for SIMSOPT fields.
+        source_grid: Grid used to discretize a DESC ``_MagneticField`` when
+            computing B via Biot-Savart. Ignored for SIMSOPT fields.
+            Default is ``None``.
+        curl_B: Also tabulate curl B (= mu0 J, physical cylindrical components)
+            after the flux label, for the full (non-vacuum) guiding-center
+            equations. DESC fields only; needs ``flux_label``.
+        **kwargs: Additional keyword arguments. For DESC fields,
+            ``chunk_size`` (default 100) controls the chunk size used by
+            ``vmap_chunked`` when computing the gradient of |B|.
 
     Returns:
         r_range : (r_start, r_end, number of grid points in r)
@@ -197,14 +238,42 @@ def cartesian_interpolant(field, surface_classifier):
         z_range : (z_start, z_end, number of grid points in z)
         cell_quad_pts : Interpolant data reordered for GPU access. Shape is
             ``(n_cells * 64, n_features)`` where columns contain the magnetic
-            field, gradient of |B|, and signed distance function values at
-            the spline quadrature nodes for each cell.
+            field, gradient of |B|, the signed distance function, and, when
+            ``flux_label`` is given, the flux label values at the spline
+            quadrature nodes for each cell.
     """
+    # ---- Detect field type ------------------------------------------------
+    try:
+        from simsopt.field import InterpolatedField
 
-    r_range = (field.r_range[0], field.r_range[1], 3 * field.r_range[2] + 1)
-    phi_range = (field.phi_range[0], field.phi_range[1], 3 * field.phi_range[2] + 1)
-    z_range = (field.z_range[0], field.z_range[1], 3 * field.z_range[2] + 1)
+        is_simsopt = isinstance(field, InterpolatedField)
+    except ImportError:
+        is_simsopt = False
 
+    if is_simsopt:
+        # SIMSOPT: ranges come from the field object
+        r_range = (field.r_range[0], field.r_range[1], 3 * field.r_range[2] + 1)
+        phi_range = (field.phi_range[0], field.phi_range[1], 3 * field.phi_range[2] + 1)
+        z_range = (field.z_range[0], field.z_range[1], 3 * field.z_range[2] + 1)
+        n_r_cells = field.r_range[2]
+        n_phi_cells = field.phi_range[2]
+        n_z_cells = field.z_range[2]
+    else:
+        # DESC (or other): ranges must be provided by the user
+        if rrange is None or zrange is None or phirange is None:
+            raise ValueError(
+                "rrange, zrange, and phirange must be provided for "
+                "non-SIMSOPT fields. Each should be a tuple "
+                "(start, end, n_cells)."
+            )
+        r_range = (rrange[0], rrange[1], 3 * rrange[2] + 1)
+        phi_range = (phirange[0], phirange[1], 3 * phirange[2] + 1)
+        z_range = (zrange[0], zrange[1], 3 * zrange[2] + 1)
+        n_r_cells = rrange[2]
+        n_phi_cells = phirange[2]
+        n_z_cells = zrange[2]
+
+    # ---- Build cylindrical grid -------------------------------------------
     r_grid = np.linspace(r_range[0], r_range[1], r_range[2])
     phi_grid = np.linspace(phi_range[0], phi_range[1], phi_range[2])
     z_grid = np.linspace(z_range[0], z_range[1], z_range[2])
@@ -219,35 +288,107 @@ def cartesian_interpolant(field, surface_classifier):
                     z_grid[k],
                 ]
 
-    field.set_points_cyl(quad_pts)
+    # ---- Compute B and GradAbsB ------------------------------------------
+    if is_simsopt:
+        field.set_points_cyl(quad_pts)
+        B = field.B_cyl()
+        GradAbsB = field.GradAbsB_cyl()
+    else:
+        # DESC path
+        import jax
+        import jax.numpy as jnp
+        from desc.batching import vmap_chunked
+        from desc.backend import print_backend_info
 
-    # Quantities to interpolate
-    B = field.B_cyl()
-    GradAbsB = field.GradAbsB_cyl()
+        print_backend_info()
+        print("computing DESC field")
+        B = np.array(
+            field.compute_magnetic_field(quad_pts, basis="rpz", source_grid=source_grid)
+        )
+        print("finished computing DESC field")
 
+        # Compute GradAbsB via JAX autodiff + chunked vmap
+        def absB_at_point(rpz):
+            """Compute |B| at a single (R, phi, Z) point."""
+            B_rpz = field.compute_magnetic_field(
+                rpz.reshape(1, 3), basis="rpz", source_grid=source_grid
+            )
+            return jnp.sqrt(jnp.sum(B_rpz**2))
+
+        grad_absB_fn = jax.grad(absB_at_point)
+        chunk_size = kwargs.get("chunk_size", 1000)
+        print("computing desc field gradient")
+        GradAbsB = np.array(
+            vmap_chunked(grad_absB_fn, chunk_size=chunk_size)(jnp.array(quad_pts))
+        )
+        # jax.grad gives d|B|/d(R, phi, Z), but the kernel expects the physical
+        # cylindrical components (d|B|/dR, (1/R) d|B|/dphi, d|B|/dZ), as SIMSOPT's
+        # GradAbsB_cyl returns
+        GradAbsB[:, 1] /= quad_pts[:, 0]
+        print("finished computing desc field gradient")
+
+        if curl_B:
+            # dB_i/d(R, phi, Z) of the physical cylindrical components, then
+            # curl B = ((1/R) dBz/dphi - dBphi/dZ, dBr/dZ - dBz/dR,
+            #           dBphi/dR + Bphi/R - (1/R) dBr/dphi)
+            def B_at_point(rpz):
+                return field.compute_magnetic_field(
+                    rpz.reshape(1, 3), basis="rpz", source_grid=source_grid
+                )[0]
+
+            print("computing desc field curl")
+            jac = np.array(
+                vmap_chunked(jax.jacfwd(B_at_point), chunk_size=chunk_size)(
+                    jnp.array(quad_pts)
+                )
+            )
+            R = quad_pts[:, 0]
+            CurlB = np.column_stack(
+                [
+                    jac[:, 2, 1] / R - jac[:, 1, 2],
+                    jac[:, 0, 2] - jac[:, 2, 0],
+                    jac[:, 1, 0] + B[:, 1] / R - jac[:, 0, 1] / R,
+                ]
+            )
+            print("finished computing desc field curl")
+
+    # ---- Signed distance + combine features -------------------------------
     signed_dist_vals = surface_classifier.evaluate_rphiz(quad_pts)
 
-    quad_info = np.hstack((B, GradAbsB, signed_dist_vals))
+    if curl_B and (is_simsopt or flux_label is None):
+        raise ValueError("curl_B needs a DESC field and a flux_label")
+    if flux_label is None:
+        quad_info = np.hstack((B, GradAbsB, signed_dist_vals))
+    else:
+        s_vals = np.asarray(flux_label(quad_pts), dtype=float).reshape(-1)
+        if s_vals.shape[0] != quad_pts.shape[0]:
+            raise ValueError(
+                f"flux_label returned {s_vals.shape[0]} values for "
+                f"{quad_pts.shape[0]} grid points"
+            )
+        if not np.all(np.isfinite(s_vals)):
+            raise ValueError(
+                "flux_label returned non-finite values on the interpolation "
+                "grid; extend it smoothly beyond the last closed flux surface "
+                "(values above 1 are clamped by the profile lookup)"
+            )
+        quad_info = np.hstack((B, GradAbsB, signed_dist_vals, s_vals[:, None]))
+        if curl_B:
+            quad_info = np.hstack((quad_info, CurlB))
 
-    # reorder for device memory accesses
-    # print("reordering interpolant data form device accesses")
+    # ---- Reorder for device memory accesses -------------------------------
     cell_quad_pts = np.empty(
         (
-            field.r_range[2] * field.z_range[2] * field.phi_range[2] * 64,
+            n_r_cells * n_z_cells * n_phi_cells * 64,
             quad_info.shape[1],
         )
     )
-    for cell_r in range(field.r_range[2]):
-        for cell_phi in range(field.phi_range[2]):
-            for cell_z in range(field.z_range[2]):
+    for cell_r in range(n_r_cells):
+        for cell_phi in range(n_phi_cells):
+            for cell_z in range(n_z_cells):
                 row_start = 64 * (
-                    cell_r * field.phi_range[2] * field.z_range[2]
-                    + cell_phi * field.z_range[2]
-                    + cell_z
+                    cell_r * n_phi_cells * n_z_cells + cell_phi * n_z_cells + cell_z
                 )
-
-                # if cell_r == 24 and cell_phi == 22 and cell_z == 20:
-                #     print(row_start)
 
                 assert 3 * cell_r + i < r_range[2]
                 # iterate over spline locations for this cell
